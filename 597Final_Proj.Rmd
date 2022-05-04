@@ -1,0 +1,584 @@
+---
+title: "597_Stock_Analysis"
+author: "Zhuofan Dong and Guangjian Li"
+date: "4/24/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Part0: Pre-setting
+
+**Broad goal: We hope to make investment decisions during the pandemic, because this is the time that the market is under great uncertainty. Experienced investors will look for the opportunities to make profit from such uncertainty. **
+
+**Datasets: 1. SP500.CSV: first 30 stocks from benchmark s&p 500 ranked by market capitalization 2. stock data from yahoo finance package in r 3. Dataset of news headlines from Kaggle.**
+
+
+```{r setting directory}
+setwd("C:\\Users\\Primo\\OneDrive\\Desktop\\597")
+```
+
+
+**Import packages**
+```{r import packages}
+library(quantmod)
+library(PerformanceAnalytics)
+library(e1071)
+library(quadprog)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+library(stringr)
+library(lubridate)
+library(data.table)
+library(tidytext)
+library(wordcloud)
+library(RColorBrewer)
+library(devtools)
+library(gtrendsR)
+library(plotly)
+library(textdata)
+library(DT)
+library(rvest)
+library(splusTimeDate)
+library(reshape2)
+```
+
+
+
+
+
+## Part1:Data Overview
+
+**Extract the historical data of selected tickers from yahoo finance package by 'getSymbols' function, modified variable names and index. **
+
+```{r get stock data from yahoo finance}
+start = as.Date("2020-01-01") 
+end = as.Date("2022-03-31")
+
+getSymbols(c("AAPL", "GOOGL", "MSFT", "AMZN", "^GSPC"), src = "yahoo", from = start, to = end)
+
+stocks_overview = as.xts(data.frame(A = AAPL[, "AAPL.Adjusted"], 
+                           B = GOOGL[, "GOOGL.Adjusted"], 
+                           C = MSFT[, "MSFT.Adjusted"],
+                           D = AMZN[, "AMZN.Adjusted"],
+                           E = GSPC[,"GSPC.Adjusted"]))
+names(stocks_overview) = c("Apple", "Google", "Microsoft", "Amazon", "S&P 500")
+index(stocks_overview) = as.Date(index(stocks_overview))
+
+stocks_overview
+
+
+```
+
+**Do the visualization of selected stocks**
+
+```{r plot the selected tickers}
+stocks_overview_plot = tidy(stocks_overview) %>% 
+  
+  ggplot(aes(x=index,y=value, color=series)) +
+  labs(title = "Top Four US Tech Comany and S&P 500: Daily Stock Prices January 2020 - August 2021",
+       
+       subtitle = "End of Day Adjusted Prices",
+       caption = " Source: Yahoo Finance") +
+  
+  xlab("Date") + ylab("Price") +
+  scale_color_manual(values = c("Red", "Black", "DarkBlue","Orange","Yellow"))+
+  geom_line()
+
+stocks_overview_plot
+```
+
+*Plot the correlation matrix of selected tickers*
+
+```{r calculate and plot the correlation matrix}
+corr_mat <- as.matrix(stocks_overview) %>% cor()
+head(corr_mat)
+
+melted_cormat <- melt(corr_mat)
+
+ggplot(data = melted_cormat, aes(x=Var1, y=Var2, fill = value)) +
+  geom_tile()
+```
+
+*It is quite clear that the correlation between top 4 tech companies is pretty high. If we can make profit of one ticker, we will also have the opportunities to make profit by investing others.*
+
+
+
+
+
+## Part2:Sentimental Analysis
+
+**Goal: We hope to get insights into the market by conducting sentimental analysis to news headlines. In this case, we are looking for the hotspots of the market and deciding whether our strategies are in right direction.**
+
+**Preparing the data**
+*We tried a different way to extract the data from the web*
+```{r prepare the data of the benchmark}
+t1<- ISOdate(2020,01,01,hour = 0)
+as.integer(t1)
+t2<- ISOdate(2022,03,31, hour = 0)
+as.integer(t2)
+stock<- "^GSPC"
+url <- paste("https://query1.finance.yahoo.com/v7/finance/download/",
+             stock,
+             "?period1=",
+             as.integer(t1),
+             "&period2=",
+             as.integer(t2),
+             "&interval=1d&events=history",
+             sep="")
+
+senti_ticker_data <- read.csv(url)
+
+stock_data <- drop_na(senti_ticker_data)
+
+stock_data$Name <- c("SP500")
+
+headlines_data <- read.csv("india-news-headlines.csv")
+```
+
+*Visualize the historical data of benchmark we are interested in during the period of pandemic.*
+
+```{r plot the data of the benchmark}
+plot_candlestick <- stock_data %>%
+  plot_ly(x = ~Date,
+          type = "candlestick",
+          open = ~Open,
+          close = ~Close,
+          high = ~High,
+          low = ~Low,
+          name = "price") %>%
+  layout(rangeslider=list(visible = FALSE), yaxis = list(title = "Stock Price",
+                                                         showgrid = TRUE,
+                                                         showticklabels = TRUE))
+
+plot_candlestick
+
+plot_scatter <- stock_data %>%
+  plot_ly(x = ~Date,y = ~Close, type = "scatter", mode = "lines") %>%
+  layout(rangeslider=list(visible = FALSE), yaxis = list(title = "Stock Price",
+                                                         showgrid = TRUE,
+                                                         showticklabels = TRUE))
+plot_scatter
+
+plot_volume <- stock_data %>%
+  plot_ly(x=~Date, y=~Volume, type='bar', Name = "Volume") %>%
+  layout(yaxis = list(title = "Volume"))
+
+plot_volume
+
+plot_combined <- subplot(plot_candlestick, plot_volume, heights = c(0.7,0.3), nrows=2,
+                         shareX = TRUE, titleY = TRUE) %>%
+  layout(title = paste0(stock))
+
+plot_combined
+```
+
+*In the beginning of the 2020, we observed a huge plunge in stock price. However, the market still has a great number of volume trading the benchmark. Such liquidity of the market excites us to do further analysis.*
+
+**We first use the gtrends package to visualize the interest over time(hits by google search) for the selected stock over the years.**
+
+*It is now possible to view the relationship between interest over time (‘hits’) and stock performance. A left join is used to combine trend and stock data by date. The outcome of the join is used to visualize the relationship between hits and stock close prices.*
+```{r Google search trends}
+data("countries")
+
+keyword_hits <- gtrends(keyword = stock, geo = "US", onlyInterest = TRUE)
+head(keyword_hits)
+
+keyword_hits <- keyword_hits$interest_over_time %>%
+  as_tibble() %>%
+  select(c(date, hits, keyword))
+keyword_hits$date <- as_date(ceiling_date(keyword_hits$date, unit = "weeks", change_on_boundary = NULL, week_start = getOption("lubridate.week.start",1)))
+keyword_hits %>%
+  plot_ly(x=~date, y=~hits, mode= 'lines', name = "Google Search keyword_hits")
+
+#Relation between hits and stock price
+
+keyword_hits<- rename(keyword_hits, Date= date)
+stock_data$Date <- as_date(stock_data$Date)
+keyword_hits %>%
+  left_join(stock_data, by= "Date") %>%
+  select(one_of(c("Date", "hits", "Close"))) %>%
+  drop_na() %>%
+  ggplot(aes(hits, Close))+
+  geom_point(color= "blue")+
+  geom_smooth(method = lm, color= "black") +
+  labs(title =paste0(stock,": Relationship between Hits and Close Stock Price"))
+
+
+```
+
+*Discussion: As we can observe from the graph above, the lower the price, the more hits of google search. This means the investments in pandemic period are highly valued by the market. *
+
+*Write tidy data into csv and save it to the directory*
+```{r saving the data into csv}
+write.table(keyword_hits,file = "keyword_hits.csv",sep = ",",col.names = TRUE)
+```
+
+
+**After performing the analysis of the google search, we are interested in how the market is reflected from the news headlines. News articles give us excellent insights into the stock market. In the next step, we conduct sentimental analysis on news headlines during the pandemic.**
+
+*Firstly, we unnest each word in the news articles, and get a bulk of words. We created a word cloud to do a quick visualization of the most frequently used words in the news headlines. afinn sentiment lexicon*
+
+*We use the afinn sentiment lexicon to assign a score to each word on a scale of -5 to 5. For analysis convenience, we grouped the data by articles and dates to summarise the score by taking the mean for each group.*
+```{r conduct sentimental analysis to the news headlines data}
+news_article <- headlines_data
+news_article<-news_article %>%
+  filter(str_detect(headline_text,'STOCK|Stock|stock|STOCKS|Stocks|stocks'))
+news_article <- transform(news_article, publish_date = as.Date(as.character(publish_date), "%Y%m%d"))
+news_article<- news_article[-c(4)]
+news_article<-news_article %>%
+  filter(publish_date>'2020-01-01')
+news_article<-news_article %>%
+  filter(publish_date<'2022-03-31')
+news_words <- news_article %>%
+  select(c("publish_date","headline_category","headline_text"))%>%
+  unnest_tokens(word, headline_text) %>%
+  filter(!word %in% append(stop_words$word, values = "chars"), str_detect(word, "^[a-z']+$"))
+news_words$publish_date = as_date(news_words$publish_date)
+words_only<- dplyr::count(news_words,word)
+set.seed(1)
+wordcloud(words = words_only$word, freq = words_only$n, scale = c(5,.5), max.words = 50, colors = brewer.pal(8, "Dark2"))
+
+afinn<- get_sentiments("afinn")
+
+sentiment_analysis <- news_words %>%
+  left_join(afinn) %>%
+  filter(!is.na(value)) %>%
+  group_by(headline_category, publish_date) %>%
+  summarise(value= mean(value)) %>%
+  mutate(sentiment= ifelse(value>0, "positive", "negative"))
+
+
+datatable(sentiment_analysis)
+ggplot(sentiment_analysis, aes(publish_date, value)) + geom_bar(stat = "identity", aes(fill=sentiment))  + ggtitle(paste0(" News Sentiment"))
+
+```
+
+*Discussion: We can observed that most words in the headlines are the negative, and the most frequent words along with stocks are mostly about the pandemic. It is reasonable to look for the investment opportunities during this periods.*
+
+
+
+
+
+
+## Part3:Portfolio Contruction
+
+*After the analysis above, we decided to invest in the market. Given the market condition, which is pretty negativeWe, we are now constructing portfolios by the skewness and kurtosis as the factors in the model. We firstly use the historical data to find the historical skewness and kurtosis on dataset, and then we use the skewness calculated to regress the kurtosis variables. After having these two coefficients vectors, we can continue backtesting the model and calculating several important criteria in portfolio theory. Finally, we have to test the statistical significance of each factor.*
+
+*We ranked top 30 stocks in the components of S&P500 benchmark by their market capitalization, and stored them Stockin SP500.csv file. Import the file and tickers, use getSymbols function to get the stock information*
+```{r prepare the 30 stock data}
+stock_pool = read.csv("SP500.csv",header = TRUE,fill = FALSE)
+stock_port = subset(stock_pool,select = Ticker)
+stock_weights = subset(stock_pool,select = Sharesout)
+symbols = as.vector(stock_port$Ticker)
+
+ticker_data <- xts()
+
+
+n <- length(symbols)
+pbar <- txtProgressBar(min = 0, max = n, style = 3)
+
+for(i in 1:length(symbols)){
+  symbols[i] -> symbol
+  tryit <- try(getSymbols(symbol, from = "2010-04-01", to = "2021-08-31", src = 'yahoo'))
+  if(inherits(tryit, "try-error")){
+    i <- i+1
+  }
+  else{
+    data <- getSymbols(symbol, from= "2010-04-01",to = "2021-08-31", src = 'yahoo')
+    ticker_data <- merge(ticker_data, Ad(get(symbols[i])))
+    rm(symbol)
+  }
+  setTxtProgressBar(pbar,i)
+}
+
+summary(ticker_data)
+```
+
+*Calculate log-difference*
+```{r function for log diff of returns}
+logdiff = function(d){
+  len = length(d[,1])
+  rets =  d[,]
+  for(j in 1:length(rets[1,])){
+    rets[1:len,j] = diff(log(rets[,j]))
+  }
+  rets = rets[2:len,]
+  return(rets)
+}
+```
+
+*We built factor models based on past data. Firstly, we calculate skewness and kurtosis of historical stock returns in the rolling-basis.*
+
+```{r calculate skew and kurt and construct portfolio in rolling window}
+Weight_cap = as.numeric(t(as.matrix(stock_weights))*as.matrix(ticker_data[1,]))/(as.matrix(t(stock_weights))%*%t(as.matrix(ticker_data[1,])))[1,1]
+Weight_cap
+
+n = length(ticker_data[,1])
+Lreturns = ticker_data[,]
+Lreturns = logdiff(Lreturns)
+skewdata = c()
+kurtdata = c()
+ret = c()
+interval = 63
+returns = cumsum(as.xts(Lreturns))
+names = c()
+for(i in 1:length(symbols)){
+  start_window = 1
+  end_window = 64
+  temp_skewness = c()
+  temp_kurtosis = c()
+  temp_r = c()
+  for(j in 1:(length(Lreturns[,1]) - interval)){ #roll from 1 to the end of the dataset - averaging size
+    temp_skewness = rbind(temp_skewness,skewness(Lreturns[(start_window:end_window),i],type = 1)) #rolling Skew calculation
+    #type 1 normalizes the measure
+    temp_kurtosis = rbind(temp_kurtosis , (kurtosis(Lreturns[(start_window:end_window),i]))) #rolling kurtosis calculation
+    r = as.vector(returns[(end_window),i]) - as.vector(returns[(start_window),i]) #individual stock returns
+    
+    temp_r = rbind(temp_r, r)
+    
+    start_window = start_window + 1
+    end_window = end_window + 1 
+  }
+  skewdata = cbind(skewdata,temp_skewness)
+  kurtdata = cbind(kurtdata,temp_kurtosis)
+  ret = cbind(ret,temp_r)
+}
+colnames(skewdata) = c(symbols)
+colnames(kurtdata) = c(symbols)
+
+average_skewness = rowMeans(skewdata)
+reg = Lreturns[((interval + 1):length(Lreturns[,1])),]
+
+ret = ret[((interval + 1):length(ret[,1])),]
+average_skewness = average_skewness[1:(length(average_skewness) - interval)]
+
+portfolio_Rets = returns%*%Weight_cap
+portfolio_Rets = as.matrix(portfolio_Rets)
+row.names(portfolio_Rets) = c(row.names(as.matrix(returns)))
+portfolio_Rets = as.xts(portfolio_Rets)
+
+colnames(ret) = c(symbols)
+print("portfolio return is :")
+head(portfolio_Rets)
+
+
+```
+
+
+*Parameters pre-setting*
+
+*Use the factor model calculated above with empirical constrains of tracking error and no beta bet to predict the future returns and backtest the result*
+
+*Calculate the regression with variables skewness and kurtosis in the rolling-window, optimize the quadratic equation by package quadprog which has the optimal solution of portfolio component weights.*
+```{r optimal portfolio construction with constrains and backtesting, warning=FALSE}
+optimal_port = c()
+Benchmark_rets = c()
+TE = c()
+port_active_weight = c()
+port_active_risk = c()
+Log_value = c()
+Benchmark_i_weight = c()
+vol = c()
+IR = c()
+dates = c()
+equally_weights = rep(1/30,30)
+equal_weight_returns = c()
+t_stat_table_ret = c()
+t_stat_table_skew = c()
+skew_regress = c()
+for(j in 0:30){
+  #now we want to predict the next 63 days out
+  
+  t = 252*3 + j*63 #tfinal
+  ts = 1 + j*63  #t-start
+  
+  
+  #these are the times to check for the regression
+  #after each iteration we push t-start and t-final out 63 days to our predicted value
+  #we then use the new values to calculate a new regression and then predict out
+  #another 63 days
+  #do this until data is exhausted
+  #if done correctly, data should be approximately 28 predictions long, i.e 7 years * 4 quarters
+  stock.fit = lm(ret[(ts:(t)),] ~ average_skewness[(ts:(t))])
+  t_stat_table_ret = c(t_stat_table_ret,coef(summary(stock.fit)))
+  
+  data_nextwindow = average_skewness[t+1]
+  skew_regress =rbind(skew_regress,data_nextwindow)
+  
+  return_predict = predict(stock.fit,data.frame(data_nextwindow)) #here we predict the return of the stock
+  real_volatility = ret^2
+  mu = return_predict[1,] #save return for optimization
+  kurtregress = kurtdata[(1:(length(kurtdata[,1]) - interval)),]
+  skewregress = skewdata[(1:(length(skewdata[,1]) - interval)),]
+  
+  volatility_estimate = c()
+  for(i in 1:length(symbols)){
+    vol.fit = lm(real_volatility[(ts:(t)),i]~ kurtregress[(ts:(t)),i] + abs(skewregress[(ts:t),i]))
+    volatility_prediction = predict(vol.fit,newdata = data.frame(kurtregress[(t+1),i],abs(skewregress[(t+1),i])))
+    volatility_estimate = cbind(volatility_estimate,volatility_prediction[1])
+    t_stat_table_skew = rbind(t_stat_table_skew,coef(summary(vol.fit))[,3])
+    
+  }
+  
+  #now that we have the estimates of mu and vol we can optimize portfolio
+  #caveats:
+  # no beta bet, calculate betas for last 3 years
+  
+  Benchmark_ret_diff = diff(portfolio_Rets)
+  Benchmark_ret_diff = Benchmark_ret_diff[((interval + ts - 1):(t + interval - 1)),]
+  Beta = Lreturns[((interval*2+ ts - 1):(t + interval*2 - 1)),]
+  
+  beta_cor_m = cor(Beta) #correlation matrix needed for optimization of the portfolio matrix
+  #i need a correlation esimate to minimize the estimated covariance matrix
+  beta_cov_m = cov(Beta) #base covariance matrix for Tracking Error
+  Beta = BetaCoVariance(Beta,Benchmark_ret_diff) #calculated daily beta for last 3 years of data
+  volatility_estimate = exp(volatility_estimate)*diag(beta_cov_m)*63
+  
+  #no shorts, no leverage, Tracking Error = 0.03 or 0.0009 = Wa'*cov*Wa
+  #we can solve using quadratic programming numerically
+  #we can use package quadprog to solve the convex function with constraints
+  
+  #we can choose what kind of covariance matrix we want to minimize for our optimization program
+  #first D designates using estimated variances but uses historical correlations
+  
+  D = sqrt(diag(as.numeric(volatility_estimate)))%*%beta_cor_m%*%sqrt(diag(as.numeric(volatility_estimate)))
+  
+  #second D designates using the esimated variance but assumes zero correlation between assets
+  
+  #third D uses just a historical covariance matrix
+  A = rep(1,length(symbols))
+  ones = rep(1,length(symbols))
+  ones = diag(ones)
+  zero = rep(0,length(symbols))
+  b0 = rbind(1,1)
+  b0 = append(b0,zero,after = length(b0))
+  
+  A = cbind((A),as.vector(t(Beta)),ones)
+  
+  mu = as.matrix(mu)
+  L = 0.5
+  
+  TE = 1
+  x = c()
+  equally_weights_after = as.numeric(t(as.matrix(stock_weights))*as.matrix(ticker_data[(t + 1 + 63*2),]))/(as.matrix(t(stock_weights))%*%t(as.matrix(ticker_data[(t + 1 + 63*2),])))[1,1]
+  while(TE > 0.0009){
+    if(L > 100000){
+      break
+    }
+    else{
+      L = L*2
+      W = solve.QP(Dmat = L*D,dvec = (1)*mu,Amat = A, bvec = b0,meq = 2)
+      
+      x = W$solution
+      TE = t(x - equally_weights_after)%*%(beta_cov_m*63)%*%(x-equally_weights_after)
+      
+    }
+  }
+  port_active_weight = rbind(port_active_weight,x)
+  
+  
+  optimal_port = rbind(optimal_port,t(x)%*%ret[(t+64),])
+  equal_weight_returns = rbind(equal_weight_returns,t(equally_weights)%*%ret[(t+64),]) 
+  Benchmark_rets = rbind(Benchmark_rets,as.numeric(portfolio_Rets[(t + 1 + 63*3)]) - as.numeric(portfolio_Rets[(t + 1 + 63*2)]))
+  dates = rbind(dates,as.character(index(portfolio_Rets[(t+1+63*3)])))  
+  
+  Benchmark_i_weight = rbind(Benchmark_i_weight, equally_weights_after)
+  #row.names(Benchmark_i_weight)[i,] = c()
+  
+  port_active_risk = rbind(port_active_risk,TE)
+  Log_value = rbind(Log_value,L)  
+  IR = rbind(IR,sqrt(TE)*2*L)
+  
+  
+}
+```
+
+*Calculate the criteria we are interested in, which are IR and IC, and plot the returns of each portfolio and benchmark.*
+
+```{r calculate the import criteria and plot the performance}
+IC = IR/sqrt(4)
+colnames(Benchmark_i_weight) = c(symbols)
+colnames(port_active_weight) = c(symbols)
+rownames(optimal_port) = c(dates)
+rownames(Benchmark_rets) = c(dates)
+rownames(equal_weight_returns) = c(dates)
+#fix out of bounds error
+post_risk = sqrt(var(optimal_port - Benchmark_rets))*sqrt(4)
+post_alpha = mean(optimal_port - Benchmark_rets)*4
+sqrt(port_active_risk)
+plot(cumsum(as.xts(optimal_port)),type = "l",main = "Asset Returns")
+lines(cumsum(as.xts(Benchmark_rets)),type = "l",col ="red")
+lines(cumsum(as.xts(equal_weight_returns)),type = "l",col = "blue")
+post_IR = post_alpha/post_risk
+post_IC = post_IR/sqrt(4)
+```
+
+*Print the final statistical result of each factor.*
+
+```{r write the result into the excel and save it to directory}
+exante_table1 = cbind(sqrt(port_active_risk),IR,IC) #ex-ante
+posthoc_table2 = cbind(post_risk,post_IR,post_IC,post_alpha) #post-hoc
+colnames(posthoc_table2) = c("post-TE","post-IR","post-IC","post-alpha")
+colnames(exante_table1) = c("ex-ante-TE","ex-ante-IR","ex-ante-IC")
+#write.table(exante_table1,file = "ex_ante.csv",sep = ",",col.names = TRUE)
+#write.table(posthoc_table2,file = "post_hoc.csv",sep = ",",col.names = TRUE)
+t_stat_table_skew = as.matrix(t_stat_table_skew)
+
+#algo to extract t-stat averages and variances
+write.table(t_stat_table_ret,file = "ret.csv",sep = ",")
+t_stats_table = read.csv("ret.csv",header = TRUE,fill = FALSE)
+t_stats_table = t(t_stats_table)
+simulate_t_table = c()
+for(i in (1:length(t_stats_table[,1]) + 1)){
+  if(i%%4 == 0){
+    simulate_t_table = rbind(simulate_t_table,t_stats_table[i-1,])
+  }
+}
+print("Mean coefficient of regression on skewness")
+colMeans(simulate_t_table)
+
+```
+
+```{r Coefficient of our model}
+simulate_t_tablet = c()
+for(i in (1:length(t_stat_table_skew[,1]) + 1)){
+  if(i%%4 == 0){
+    simulate_t_tablet = rbind(simulate_t_tablet,t_stat_table_skew[i-1,])
+  }
+}
+
+print("Mean coefficient of regression on skewness and kurtosis")
+colMeans(simulate_t_tablet)
+```
+
+*It is clear that the skewness and kurtosis have negative impact on the future stock returns, which matches the empitical studies towards the impact of skewness and kurtosis to the stock returns.*
+
+
+
+
+
+## References
+https://www.tidytextmining.com/sentiment.html#:~:text=The%20AFINN%20lexicon%20assigns%20words,positive%20scores%20indicating%20positive%20sentiment.
+
+Eric Jondeau, Qunzi Zhang, Xiaoneng Zhu, Average Skewness Matters, Journal of Financial 
+Economics, Volume 134, issue 1, 2019, pages 29-47, ISSN 0304-405X, 
+https://doi.org/10.1016/j.jfineco.2019.03.003.
+
+Youngmin Choi, Suzanne S. Lee, Realized Skewness and Future Stock Returns: The Role of 
+Information, 2004
+
+https://www.kaggle.com/datasets/therohk/india-headlines-news-dataset
+
+https://www.rdocumentation.org/packages/quadprog/versions/1.5-8/topics/solve.QP
+
+https://www.sciencedirect.com/science/article/pii/S0304405X15001257
+
+https://www.sciencedirect.com/topics/social-sciences/skewness
+
+https://www.investopedia.com/terms/k/kurtosis.asp
+
